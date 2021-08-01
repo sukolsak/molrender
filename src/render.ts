@@ -9,9 +9,10 @@ import getGLContext = require('gl')
 import fs = require('fs')
 import { PNG } from 'pngjs'
 import * as JPEG from 'jpeg-js'
+import { BehaviorSubject } from 'rxjs';
 import { createContext } from 'molstar/lib/mol-gl/webgl/context';
 import { Canvas3D, DefaultCanvas3DParams } from 'molstar/lib/mol-canvas3d/canvas3d';
-import InputObserver from 'molstar/lib/mol-util/input/input-observer';
+import { InputObserver } from 'molstar/lib/mol-util/input/input-observer';
 import { ColorTheme } from 'molstar/lib/mol-theme/color';
 import { SizeTheme } from 'molstar/lib/mol-theme/size';
 import { CartoonRepresentationProvider } from 'molstar/lib/mol-repr/structure/representation/cartoon';
@@ -19,7 +20,7 @@ import { MolecularSurfaceRepresentationProvider } from 'molstar/lib/mol-repr/str
 import { GaussianSurfaceRepresentationProvider } from 'molstar/lib/mol-repr/structure/representation/gaussian-surface';
 import { BallAndStickRepresentationProvider } from 'molstar/lib/mol-repr/structure/representation/ball-and-stick';
 import { CarbohydrateRepresentationProvider } from 'molstar/lib/mol-repr/structure/representation/carbohydrate'
-import { Model, Structure, StructureSymmetry, QueryContext, StructureSelection } from 'molstar/lib/mol-model/structure';
+import { Model, Structure, StructureSymmetry, QueryContext, StructureSelection, Trajectory } from 'molstar/lib/mol-model/structure';
 import { ModelSymmetry } from 'molstar/lib/mol-model-formats/structure/property/symmetry';
 import { RepresentationProvider } from 'molstar/lib/mol-repr/representation';
 import { compile } from 'molstar/lib/mol-script/runtime/query/compiler';
@@ -28,13 +29,17 @@ import { StructureSelectionQueries as Q } from 'molstar/lib/mol-plugin-state/hel
 import { ImagePass } from 'molstar/lib/mol-canvas3d/passes/image';
 import { PrincipalAxes } from 'molstar/lib/mol-math/linear-algebra/matrix/principal-axes';
 import { Vec3 } from 'molstar/lib/mol-math/linear-algebra';
-import Expression from 'molstar/lib/mol-script/language/expression';
+import { Expression } from 'molstar/lib/mol-script/language/expression';
 import { VisualQuality } from 'molstar/lib/mol-geo/geometry/base';
 import { getStructureQuality } from 'molstar/lib/mol-repr/util';
 import { ColorNames } from 'molstar/lib/mol-util/color/names';
 import { Camera } from 'molstar/lib/mol-canvas3d/camera';
 import { SyncRuntimeContext } from 'molstar/lib/mol-task/execution/synchronous';
 import { AssetManager } from 'molstar/lib/mol-util/assets';
+import { Task } from 'molstar/lib/mol-task';
+import { Passes } from 'molstar/lib/mol-canvas3d/passes/passes';
+import { PixelData } from 'molstar/lib/mol-util/image';
+import { now } from 'molstar/lib/mol-util/now';
 
 /**
  * Helper method to create PNG with given PNG data
@@ -147,12 +152,38 @@ export class ImageRenderer {
         })
         const webgl = createContext(this.gl)
         const input = InputObserver.create()
-        this.canvas3d = Canvas3D.create(webgl, input, {
+        const passes = new Passes(webgl)
+        const attribs = {
+            antialias: true,
+            preserveDrawingBuffer: true,
+            pixelScale: 1,
+            pickScale: 0.25,
+            enableWboit: false
+        }
+
+        const contextLost = new BehaviorSubject<now.Timestamp>(0 as now.Timestamp)
+        const canvas3dContext = {
+            canvas: undefined as unknown as HTMLCanvasElement,
+            webgl,
+            input,
+            passes,
+            attribs,
+            contextLost,
+            contextRestored: webgl.contextRestored,
+            dispose: () => {}
+        }
+
+        this.canvas3d = Canvas3D.create(canvas3dContext, {
             camera: {
                 mode: 'orthographic',
                 helper: {
                     axes: { name: 'off', params: {} }
-                }
+                },
+                stereo: { name: 'off', params: {} },
+                manualReset: false
+            },
+            cameraFog: {
+                name: 'on', params: { intensity: 50 }
             },
             renderer: {
                 ...DefaultCanvas3DParams.renderer,
@@ -164,14 +195,15 @@ export class ImageRenderer {
                 },
                 outline: {
                     name: 'off', params: {}
+                },
+                antialiasing: {
+                    name: 'off', params: {}
                 }
             }
         })
         this.imagePass = this.canvas3d.getImagePass({
-            drawPass: {
-                cameraHelper: {
-                    axes: { name: 'off', params: {} }
-                }
+            cameraHelper: {
+                axes: { name: 'off', params: {} }
             },
             multiSample: {
                 mode: 'on',
@@ -245,9 +277,10 @@ export class ImageRenderer {
      */
     async createImage(outPath: string, size: StructureSize) {
         const occlusion = size === StructureSize.Big ? { name: 'on' as const, params: {
-            kernelSize: 4,
-            bias: 0.5,
-            radius: 64,
+            samples: 32,
+            radius: 5,
+            bias: 0.8,
+            blurKernelSize: 15
         } } : { name: 'off' as const, params: {} }
         const outline = size === StructureSize.Big ? { name: 'on' as const, params: {
             scale: 1,
@@ -259,20 +292,27 @@ export class ImageRenderer {
         this.imagePass.setProps({
             postprocessing: {
                 occlusion,
-                outline
+                outline,
+                antialiasing: {
+                    name: 'off', params: {}
+                }
             }
         })
 
         this.imagePass.render()
-        const imageData = this.imagePass.colorTarget.getPixelData()
+        this.imagePass.colorTarget.bind()
+        const array = new Uint8Array(this.width * this.height * 4)
+        this.gl.readPixels(0, 0, this.width, this.height, this.gl.RGBA, this.gl.UNSIGNED_BYTE, array)
+        const pixelData: PixelData = { array, width: this.width, height: this.height }
+        PixelData.flipY(pixelData)
 
         if (this.format === 'png') {
             const generatedPng = new PNG({ width: this.width, height: this.height })
-            generatedPng.data = Buffer.from(imageData.array)
+            generatedPng.data = Buffer.from(array)
             await writePngFile(generatedPng, `${outPath}.png`)
         } else if (this.format === 'jpeg') {
             const generatedJpeg = JPEG.encode({
-                data: imageData.array,
+                data: array,
                 width: this.width,
                 height: this.height
             }, 90)
@@ -482,11 +522,11 @@ export class ImageRenderer {
         this.canvas3d.clear()
     }
 
-    async renderModels(models: ReadonlyArray<Model>, outPath: string, fileName: string) {
+    async renderModels(models: Trajectory, outPath: string, fileName: string) {
         console.log(`Rendering ${fileName} models`)
 
-        const structure = Structure.ofTrajectory(models)
-        const firstModelStructure = Structure.ofModel(models[0])
+        const structure = await Structure.ofTrajectory(models, SyncRuntimeContext)
+        const firstModelStructure = Structure.ofModel(await Task.resolveInContext(models.getFrameAtIndex(0), SyncRuntimeContext))
         const size = getStructureSize(firstModelStructure)
         const quality = getQuality(firstModelStructure)
         const colorTheme = firstModelStructure.polymerUnitCount === 1 ? 'sequence-id' : 'polymer-id'
@@ -540,31 +580,33 @@ export class ImageRenderer {
      * @param inPath path to mmCIF file
      * @param outPath directory to put rendered images
      */
-    async renderAll(models: ReadonlyArray<Model>, outPath: string, fileName: string) {
+    async renderAll(models: Trajectory, outPath: string, fileName: string) {
         // Render all models
-        for (let i = 0; i < models.length; i++) {
-            await this.renderModel(i + 1, models[i], outPath, fileName)
+        for (let i = 0; i < models.frameCount; i++) {
+            const model = await Task.resolveInContext(models.getFrameAtIndex(i), SyncRuntimeContext)
+            await this.renderModel(i + 1, model, outPath, fileName)
         }
 
         // Render all assemblies
-        const assemblies = ModelSymmetry.Provider.get(models[0])?.assemblies || []
+        const firstModel = await Task.resolveInContext(models.getFrameAtIndex(0), SyncRuntimeContext)
+        const assemblies = ModelSymmetry.Provider.get(firstModel)?.assemblies || []
         for (let i = 0, il = assemblies.length; i < il; i++) {
-            await this.renderAssembly(i, models[0], outPath, fileName)
+            await this.renderAssembly(i, firstModel, outPath, fileName)
         }
 
-        const { entities } = models[0]
-        const { label_asym_id, label_entity_id } = models[0].atomicHierarchy.chains
+        const { entities } = firstModel
+        const { label_asym_id, label_entity_id } = firstModel.atomicHierarchy.chains
 
         // Render all polymer chains
         for (let i = 0, il = label_asym_id.rowCount; i < il; i++) {
             const eI = entities.getEntityIndex(label_entity_id.value(i))
             if (entities.data.type.value(eI) !== 'polymer') continue
             const chnName = label_asym_id.value(i)
-            await this.renderChain(chnName, models[0], outPath, fileName)
+            await this.renderChain(chnName, firstModel, outPath, fileName)
         }
 
         // Render models ensemble
-        if (models.length > 1) {
+        if (models.frameCount > 1) {
             await this.renderModels(models, outPath, fileName)
         }
     }

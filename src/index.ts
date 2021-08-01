@@ -10,6 +10,8 @@ import fs = require('fs')
 import { ImageRenderer } from './render'
 import { CifFrame } from 'molstar/lib/mol-io/reader/cif';
 import { getModels, readCifFile } from './util';
+import { Task } from 'molstar/lib/mol-task';
+import { SyncRuntimeContext } from 'molstar/lib/mol-task/execution/synchronous';
 
 const parser = new argparse.ArgumentParser({
     addHelp: true,
@@ -105,13 +107,13 @@ async function main() {
             await renderer.renderAll(models, args.out, fileName)
             break
         case 'chain':
-            await renderer.renderChain(args.chainName, models[0], args.out, fileName)
+            await renderer.renderChain(args.chainName, await Task.resolveInContext(models.getFrameAtIndex(0), SyncRuntimeContext), args.out, fileName)
             break
         case 'model':
-            await renderer.renderModel(args.modIndex + 1, models[args.modIndex], args.out, fileName)
+            await renderer.renderModel(args.modIndex + 1, await Task.resolveInContext(models.getFrameAtIndex(args.modIndex), SyncRuntimeContext), args.out, fileName)
             break
         case 'assembly':
-            await renderer.renderAssembly(args.asmIndex, models[0], args.out, fileName)
+            await renderer.renderAssembly(args.asmIndex, await Task.resolveInContext(models.getFrameAtIndex(0), SyncRuntimeContext), args.out, fileName)
             break
         case 'models':
             await renderer.renderModels(models, args.out, fileName)
